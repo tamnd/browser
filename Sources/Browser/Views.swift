@@ -32,11 +32,11 @@ struct RootView: View {
             if let banner = model.banner {
                 BannerView(text: banner)
             }
-            if model.showOmnibox {
-                OmniboxOverlay()
-            }
             if model.showPalette {
                 PaletteOverlay()
+            }
+            if let pending = model.pendingKeys {
+                PendingKeysView(keys: pending)
             }
         }
         .background(model.theme.color("bg.base", scheme))
@@ -386,74 +386,34 @@ struct WebViewContainer: NSViewRepresentable {
     }
 }
 
-struct OmniboxOverlay: View {
-    @EnvironmentObject var model: AppModel
-    @Environment(\.colorScheme) var scheme
-    @FocusState private var focused: Bool
-
-    var body: some View {
-        VStack(spacing: 0) {
-            TextField("Search or enter address", text: $model.omniboxText)
-                .textFieldStyle(.plain)
-                .font(.system(size: 16))
-                .padding(14)
-                .focused($focused)
-                .onChange(of: model.omniboxText) {
-                    model.refreshOmniboxSuggestions()
-                }
-                .onSubmit {
-                    model.commitOmnibox()
-                }
-            if !model.omniboxSuggestions.isEmpty {
-                Rectangle().fill(model.theme.color("border", scheme)).frame(height: 1)
-                VStack(spacing: 0) {
-                    ForEach(Array(model.omniboxSuggestions.enumerated()), id: \.element.id) { index, suggestion in
-                        SuggestionRow(
-                            title: suggestion.title,
-                            detail: suggestion.detail,
-                            selected: index == model.omniboxSelection
-                        )
-                        .onTapGesture {
-                            model.omniboxSelection = index
-                            model.commitOmnibox()
-                        }
-                    }
-                }
-                .padding(6)
-            }
-        }
-        .overlayCard(theme: model.theme, scheme: scheme)
-        .onAppear { focused = true }
-    }
-}
-
 struct PaletteOverlay: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.colorScheme) var scheme
     @FocusState private var focused: Bool
 
     var body: some View {
-        let matches = model.commands.paletteCommands(query: model.paletteText)
+        let mode = PaletteMode.parse(model.paletteText).mode
         VStack(spacing: 0) {
-            TextField("Type a command", text: $model.paletteText)
+            TextField(mode.placeholder, text: $model.paletteText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 16))
                 .padding(14)
                 .focused($focused)
                 .onChange(of: model.paletteText) {
                     model.paletteSelection = 0
+                    model.refreshPalette()
                 }
                 .onSubmit {
                     model.commitPalette()
                 }
-            if !matches.isEmpty {
+            if !model.paletteRows.isEmpty {
                 Rectangle().fill(model.theme.color("border", scheme)).frame(height: 1)
                 ScrollView {
                     VStack(spacing: 0) {
-                        ForEach(Array(matches.prefix(12).enumerated()), id: \.element.id) { index, command in
+                        ForEach(Array(model.paletteRows.enumerated()), id: \.element.id) { index, row in
                             SuggestionRow(
-                                title: command.title,
-                                detail: model.keymap.chord(for: command.id)?.description ?? command.category,
+                                title: row.title,
+                                detail: detail(for: row),
                                 selected: index == model.paletteSelection
                             )
                             .onTapGesture {
@@ -469,6 +429,36 @@ struct PaletteOverlay: View {
         }
         .overlayCard(theme: model.theme, scheme: scheme)
         .onAppear { focused = true }
+    }
+
+    private func detail(for row: PaletteRow) -> String {
+        switch row {
+        case .command(let command):
+            return model.keymap.sequence(for: command.id)?.description ?? command.category
+        case .suggestion(let suggestion):
+            return suggestion.detail
+        case .tab(_, _, _, let detail):
+            return detail
+        }
+    }
+}
+
+struct PendingKeysView: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.colorScheme) var scheme
+    let keys: String
+
+    var body: some View {
+        Text(keys)
+            .font(.system(size: 12, design: .monospaced))
+            .foregroundStyle(model.theme.color("fg.muted", scheme))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(model.theme.color("bg.raised", scheme))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(model.theme.color("border", scheme)))
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+            .padding(16)
     }
 }
 
