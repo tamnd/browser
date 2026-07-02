@@ -86,6 +86,42 @@ struct SearchSection: Codable, Equatable {
     }
 }
 
+struct PrivacySection: Codable, Equatable {
+    var blockTrackers: Bool = true
+    var allowlist: [String] = []
+
+    init() {}
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        blockTrackers = try c.decodeIfPresent(Bool.self, forKey: .blockTrackers) ?? true
+        allowlist = try c.decodeIfPresent([String].self, forKey: .allowlist) ?? []
+    }
+}
+
+struct TabsSection: Codable, Equatable {
+    var maxLiveWebviews: Int = 12
+
+    init() {}
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        maxLiveWebviews = min(max(try c.decodeIfPresent(Int.self, forKey: .maxLiveWebviews) ?? 12, 2), 64)
+    }
+}
+
+struct DownloadsSection: Codable, Equatable {
+    var directory: String = "~/Downloads"
+
+    init() {}
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        directory = try c.decodeIfPresent(String.self, forKey: .directory) ?? "~/Downloads"
+    }
+
+    var resolvedURL: URL {
+        URL(fileURLWithPath: (directory as NSString).expandingTildeInPath, isDirectory: true)
+    }
+}
+
 struct PluginsSection: Codable, Equatable {
     var enabled: [String] = []
 
@@ -102,6 +138,9 @@ struct AppConfig: Codable, Equatable {
     var appearance = AppearanceSection()
     var layout = LayoutSection()
     var search = SearchSection()
+    var privacy = PrivacySection()
+    var tabs = TabsSection()
+    var downloads = DownloadsSection()
     var plugins = PluginsSection()
 
     init() {}
@@ -112,6 +151,9 @@ struct AppConfig: Codable, Equatable {
         appearance = try c.decodeIfPresent(AppearanceSection.self, forKey: .appearance) ?? AppearanceSection()
         layout = try c.decodeIfPresent(LayoutSection.self, forKey: .layout) ?? LayoutSection()
         search = try c.decodeIfPresent(SearchSection.self, forKey: .search) ?? SearchSection()
+        privacy = try c.decodeIfPresent(PrivacySection.self, forKey: .privacy) ?? PrivacySection()
+        tabs = try c.decodeIfPresent(TabsSection.self, forKey: .tabs) ?? TabsSection()
+        downloads = try c.decodeIfPresent(DownloadsSection.self, forKey: .downloads) ?? DownloadsSection()
         plugins = try c.decodeIfPresent(PluginsSection.self, forKey: .plugins) ?? PluginsSection()
     }
 
