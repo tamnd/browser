@@ -1,0 +1,33 @@
+{
+  "name": "paper",
+  "variants": {
+    "light": {
+      "bg.base": "#faf8f2",
+      "bg.surface": "#f1eee5",
+      "bg.raised": "#ffffff",
+      "fg.primary": "#2b2a26",
+      "fg.muted": "#75726a",
+      "fg.faint": "#aba89e",
+      "accent": "#a5674a",
+      "border": "#e0dcd0",
+      "tab.active.bg": "#e8e4d8",
+      "tab.hover.bg": "#efece2",
+      "palette.bg": "#fffdf8",
+      "palette.selection": "#f3e9e1"
+    },
+    "dark": {
+      "bg.base": "#211f1c",
+      "bg.surface": "#282623",
+      "bg.raised": "#302e2a",
+      "fg.primary": "#e8e4da",
+      "fg.muted": "#a09c92",
+      "fg.faint": "#67645c",
+      "accent": "#c98963",
+      "border": "#3a3833",
+      "tab.active.bg": "#383630",
+      "tab.hover.bg": "#2e2c27",
+      "palette.bg": "#2b2926",
+      "palette.selection": "#453e33"
+    }
+  }
+}
