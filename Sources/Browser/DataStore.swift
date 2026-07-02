@@ -75,6 +75,15 @@ final class DataStore {
             PRAGMA user_version = 1;
             """)
         }
+        if version < 2 {
+            try exec("""
+            CREATE TABLE IF NOT EXISTS site_zoom (
+                host TEXT PRIMARY KEY,
+                zoom REAL NOT NULL
+            );
+            PRAGMA user_version = 2;
+            """)
+        }
     }
 
     private func scalarInt(_ sql: String) -> Int? {
@@ -156,6 +165,40 @@ final class DataStore {
                 out.append(HistoryEntry(url: url, title: title, visitCount: count))
             }
             return out
+        }
+    }
+
+    // MARK: Per-site zoom
+
+    func setZoom(_ zoom: Double, host: String) {
+        guard !host.isEmpty else { return }
+        queue.sync {
+            var stmt: OpaquePointer?
+            if abs(zoom - 1.0) < 0.001 {
+                guard sqlite3_prepare_v2(db, "DELETE FROM site_zoom WHERE host = ?1", -1, &stmt, nil) == SQLITE_OK else { return }
+                defer { sqlite3_finalize(stmt) }
+                sqlite3_bind_text(stmt, 1, host, -1, DataStore.transient)
+                sqlite3_step(stmt)
+                return
+            }
+            let sql = "INSERT INTO site_zoom (host, zoom) VALUES (?1, ?2) ON CONFLICT(host) DO UPDATE SET zoom = excluded.zoom"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_text(stmt, 1, host, -1, DataStore.transient)
+            sqlite3_bind_double(stmt, 2, zoom)
+            sqlite3_step(stmt)
+        }
+    }
+
+    func zoom(forHost host: String) -> Double? {
+        guard !host.isEmpty else { return nil }
+        return queue.sync {
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT zoom FROM site_zoom WHERE host = ?1", -1, &stmt, nil) == SQLITE_OK else { return nil }
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_text(stmt, 1, host, -1, DataStore.transient)
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+            return sqlite3_column_double(stmt, 0)
         }
     }
 
