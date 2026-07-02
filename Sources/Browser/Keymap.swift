@@ -60,9 +60,43 @@ struct KeyChord: Hashable, CustomStringConvertible {
     }
 }
 
+// A binding is one or more chords typed in order, like "g t".
+struct KeySequence: Hashable, CustomStringConvertible {
+    var chords: [KeyChord]
+
+    init(_ chords: [KeyChord]) {
+        self.chords = chords
+    }
+
+    static func parse(_ raw: String) -> KeySequence? {
+        let parts = raw.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard !parts.isEmpty else { return nil }
+        var chords: [KeyChord] = []
+        for part in parts {
+            guard let chord = KeyChord.parse(part) else { return nil }
+            chords.append(chord)
+        }
+        return KeySequence(chords)
+    }
+
+    func isPrefix(of other: KeySequence) -> Bool {
+        chords.count < other.chords.count && Array(other.chords.prefix(chords.count)) == chords
+    }
+
+    var description: String {
+        chords.map(\.description).joined(separator: " ")
+    }
+}
+
 struct Keymap: Equatable {
-    private(set) var bindings: [KeyChord: String]
+    private(set) var bindings: [KeySequence: String]
     private(set) var warnings: [String]
+
+    enum Match: Equatable {
+        case none
+        case prefix
+        case command(String)
+    }
 
     static let defaults: [String: String] = [
         "cmd+t": "tab.new",
@@ -78,6 +112,7 @@ struct Keymap: Equatable {
         "cmd+shift+g": "find.prev",
         "cmd+l": "omnibox.open",
         "cmd+k": "palette.open",
+        "cmd+shift+k": "tab.search",
         "cmd+b": "sidebar.toggle",
         "cmd+[": "nav.back",
         "cmd+]": "nav.forward",
@@ -102,34 +137,60 @@ struct Keymap: Equatable {
         "cmd+9": "workspace.switch-9",
     ]
 
-    init(user: [String: String?] = [:]) {
-        var resolved: [KeyChord: String] = [:]
+    // Layering: defaults, then plugin suggestions, then the user file. User always wins.
+    init(user: [String: String?] = [:], suggested: [String: String] = [:]) {
+        var resolved: [KeySequence: String] = [:]
         var warns: [String] = []
         for (raw, command) in Keymap.defaults {
-            guard let chord = KeyChord.parse(raw) else { continue }
-            resolved[chord] = command
+            guard let sequence = KeySequence.parse(raw) else { continue }
+            resolved[sequence] = command
+        }
+        for (raw, command) in suggested {
+            guard let sequence = KeySequence.parse(raw) else {
+                warns.append("plugin keymap: cannot parse \"\(raw)\"")
+                continue
+            }
+            resolved[sequence] = command
         }
         for (raw, command) in user {
-            guard let chord = KeyChord.parse(raw) else {
+            guard let sequence = KeySequence.parse(raw) else {
                 warns.append("keymap: cannot parse chord \"\(raw)\"")
                 continue
             }
             if let command, !command.isEmpty {
-                resolved[chord] = command
+                resolved[sequence] = command
             } else {
-                resolved.removeValue(forKey: chord)
+                resolved.removeValue(forKey: sequence)
+            }
+        }
+        // A binding that is also the start of a longer one fires immediately
+        // and makes the longer one unreachable, so say so at load time.
+        for (sequence, command) in resolved {
+            if let shadowed = resolved.keys.first(where: { sequence.isPrefix(of: $0) }) {
+                warns.append("keymap: \"\(sequence)\" (\(command)) hides the longer binding \"\(shadowed)\"")
             }
         }
         bindings = resolved
-        warnings = warns
+        warnings = warns.sorted()
+    }
+
+    func match(_ chords: [KeyChord]) -> Match {
+        let candidate = KeySequence(chords)
+        if let command = bindings[candidate] {
+            return .command(command)
+        }
+        if bindings.keys.contains(where: { candidate.isPrefix(of: $0) }) {
+            return .prefix
+        }
+        return .none
     }
 
     func command(for chord: KeyChord) -> String? {
-        bindings[chord]
+        bindings[KeySequence([chord])]
     }
 
-    func chord(for commandID: String) -> KeyChord? {
-        bindings.first { $0.value == commandID }?.key
+    func sequence(for commandID: String) -> KeySequence? {
+        bindings.filter { $0.value == commandID }.keys.min { $0.description < $1.description }
     }
 
     static func loadUser(from url: URL) -> [String: String?] {

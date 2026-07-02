@@ -25,7 +25,7 @@ enum Profile {
         }
         try writeIfMissing(configURL, defaultConfigJSON)
         try writeIfMissing(blocklistURL, defaultBlocklistJSON)
-        try writeIfMissing(keymapURL, "{\n  \"_help\": \"chord -> command id, null unbinds a default, see README.md\"\n}\n")
+        try writeIfMissing(keymapURL, "{\n  \"_help\": \"chord -> command id, null unbinds a default, multi-key sequences are space separated like \\\"g t\\\", see README.md\"\n}\n")
         let graphite = themesURL.appendingPathComponent("graphite", isDirectory: true)
         try fm.createDirectory(at: graphite, withIntermediateDirectories: true)
         try writeIfMissing(graphite.appendingPathComponent("theme.json"), defaultThemeJSON)
@@ -70,7 +70,8 @@ enum Profile {
         "directory": "~/Downloads"
       },
       "plugins": {
-        "enabled": []
+        "enabled": [],
+        "devMode": false
       }
     }
     """
@@ -106,11 +107,11 @@ enum Profile {
     Every file is plain text, safe to edit by hand, and picked up while the app runs.
 
     - `config.json` is the settings file. The app rewrites it only when you change settings from inside the app.
-    - `keymap.json` maps key chords to command ids, like `"cmd+shift+x": "tab.close"`. Use `null` to unbind a default.
+    - `keymap.json` maps key chords to command ids, like `"cmd+shift+x": "tab.close"`. Use `null` to unbind a default. Space separates a multi-key sequence, like `"g t": "tab.next"`.
     - `blocklist.json` drives the tracker blocker: domains to block, sites to allowlist, and raw WebKit content rules.
     - `themes/<name>/theme.json` holds design tokens for the chrome, with `light` and `dark` variants.
     - `snippets/*.css` are injected into every page you visit, in alphabetical order.
-    - `plugins/<id>/` holds a plugin: a `manifest.json` and a `main.js`. Enable ids in `config.json` under `plugins.enabled`.
+    - `plugins/<id>/` holds a plugin: a `manifest.json` and a `main.js`. Enable ids in `config.json` under `plugins.enabled`. Set `plugins.devMode` to true and saves inside a plugin folder reload it live.
     - `favicons/` is the icon cache. Safe to delete, it refills as you browse.
     - `data.sqlite` is history, per-site zoom, and session state. It belongs to the app, leave it alone.
 

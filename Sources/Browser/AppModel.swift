@@ -14,14 +14,11 @@ final class AppModel: ObservableObject {
     @Published var sidebarVisible = true
     @Published var banner: String?
 
-    @Published var showOmnibox = false
-    @Published var omniboxText = ""
-    @Published var omniboxSuggestions: [OmniboxSuggestion] = []
-    @Published var omniboxSelection = 0
-
     @Published var showPalette = false
     @Published var paletteText = ""
+    @Published var paletteRows: [PaletteRow] = []
     @Published var paletteSelection = 0
+    @Published var pendingKeys: String?
 
     @Published var showFind = false
     @Published var findText = ""
@@ -39,8 +36,11 @@ final class AppModel: ObservableObject {
     private var blockingEnabled = true
     private var runtimeAllowlist: Set<String> = []
     private var watcher: DirectoryWatcher?
+    private var pluginWatcher: DirectoryWatcher?
     private var keyMonitor: Any?
     private var sessionSaveTimer: Timer?
+    private var pendingChords: [KeyChord] = []
+    private var sequenceTimer: Timer?
 
     var activeWorkspaceIndex: Int {
         workspaces.firstIndex { $0.id == activeWorkspaceID } ?? 0
@@ -77,8 +77,27 @@ final class AppModel: ObservableObject {
         }
         let host = PluginHost(model: self)
         pluginHost = host
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             host.loadEnabled()
+            self?.rebuildKeymap()
+            self?.setupPluginDevMode()
+        }
+    }
+
+    func rebuildKeymap() {
+        keymap = Keymap(user: Keymap.loadUser(from: Profile.keymapURL), suggested: pluginHost?.suggestedKeys ?? [:])
+    }
+
+    // Dev mode watches each enabled plugin folder and reloads the plugin on save.
+    private func setupPluginDevMode() {
+        guard config.plugins.devMode else {
+            pluginWatcher = nil
+            return
+        }
+        let dirs = config.plugins.enabled.map { Profile.pluginsURL.appendingPathComponent($0, isDirectory: true) }
+        guard !dirs.isEmpty else { return }
+        pluginWatcher = DirectoryWatcher(urls: dirs) { [weak self] in
+            self?.pluginHost?.reloadEnabled()
         }
     }
 
@@ -87,7 +106,8 @@ final class AppModel: ObservableObject {
         let firstLoad = workspaces.isEmpty
         config = loaded
         theme = Theme.load(name: loaded.appearance.theme, themesDir: Profile.themesURL)
-        keymap = Keymap(user: Keymap.loadUser(from: Profile.keymapURL))
+        rebuildKeymap()
+        setupPluginDevMode()
         if firstLoad {
             sidebarVisible = loaded.layout.sidebarVisible
         }
@@ -166,6 +186,7 @@ final class AppModel: ObservableObject {
         } else {
             downloads[i].state = .done
         }
+        pluginHost?.emit("download.finished", ["filename": downloads[i].filename, "error": error ?? ""])
     }
 
     private func restoreOrSeedSession() {
@@ -217,6 +238,7 @@ final class AppModel: ObservableObject {
             openOmnibox()
         }
         scheduleSessionSave()
+        pluginHost?.emit("tab.created", ["id": tab.id.uuidString, "url": url?.absoluteString ?? ""])
         return tab.id
     }
 
@@ -251,6 +273,7 @@ final class AppModel: ObservableObject {
         activeWorkspace = ws
         webViews.discard(tabID: target)
         scheduleSessionSave()
+        pluginHost?.emit("tab.closed", ["id": closed.id.uuidString, "url": closed.url?.absoluteString ?? "", "title": closed.title])
     }
 
     func reopenTab() {
@@ -280,6 +303,7 @@ final class AppModel: ObservableObject {
         }
         activeWorkspace = ws
         scheduleSessionSave()
+        pluginHost?.emit("tab.activated", ["id": id.uuidString])
     }
 
     func cycleTab(_ delta: Int) {
@@ -330,8 +354,10 @@ final class AppModel: ObservableObject {
 
     func switchWorkspace(_ index: Int) {
         guard index >= 0, index < workspaces.count else { return }
+        guard workspaces[index].id != activeWorkspaceID else { return }
         activeWorkspaceID = workspaces[index].id
         scheduleSessionSave()
+        pluginHost?.emit("workspace.switched", ["name": workspaces[index].name, "index": index])
     }
 
     func cycleWorkspace(_ delta: Int) {
@@ -402,81 +428,101 @@ final class AppModel: ObservableObject {
         }
     }
 
-    // MARK: Omnibox and palette
+    // MARK: Unified palette
 
     func openOmnibox() {
-        showPalette = false
-        omniboxText = activeWorkspace.activeTabID.flatMap { tab($0)?.url?.absoluteString } ?? ""
-        omniboxSelection = 0
-        refreshOmniboxSuggestions()
-        showOmnibox = true
+        openPalette(prefill: activeWorkspace.activeTabID.flatMap { tab($0)?.url?.absoluteString } ?? "")
     }
 
-    func openPalette() {
-        showOmnibox = false
-        paletteText = ""
+    func openCommandPalette() {
+        openPalette(prefill: ">")
+    }
+
+    func openTabSearch() {
+        openPalette(prefill: "#")
+    }
+
+    private func openPalette(prefill: String) {
+        paletteText = prefill
         paletteSelection = 0
+        refreshPalette()
         showPalette = true
     }
 
     func closeOverlays() {
-        showOmnibox = false
         showPalette = false
     }
 
-    func refreshOmniboxSuggestions() {
-        var out: [OmniboxSuggestion] = []
-        let query = omniboxText.trimmingCharacters(in: .whitespaces)
-        if let action = OmniboxClassifier.classify(query, search: config.search) {
-            switch action {
-            case .navigate(let url):
-                out.append(OmniboxSuggestion(kind: .action, title: url.absoluteString, detail: "Open", url: url))
-            case .search(let engine, let q):
-                out.append(OmniboxSuggestion(kind: .action, title: q, detail: "Search \(engine.name)", url: engine.searchURL(for: q)))
+    func refreshPalette() {
+        let (mode, query) = PaletteMode.parse(paletteText)
+        var out: [PaletteRow] = []
+        switch mode {
+        case .command:
+            out = commands.paletteCommands(query: query).prefix(12).map { .command($0) }
+        case .tabs:
+            for (wi, ws) in workspaces.enumerated() {
+                for t in ws.tabs {
+                    let target = "\(ws.name) \(t.title) \(t.url?.absoluteString ?? "")"
+                    if query.isEmpty || FuzzyMatch.score(query: query, target: target) != nil {
+                        let title = t.title.isEmpty ? (t.url?.host ?? "New Tab") : t.title
+                        out.append(.tab(tabID: t.id, workspaceIndex: wi, title: title, detail: ws.name))
+                    }
+                    if out.count >= 12 { break }
+                }
+                if out.count >= 12 { break }
             }
-        }
-        if !query.isEmpty {
-            let ws = activeWorkspace
-            for t in ws.tabs where t.id != ws.activeTabID {
-                let target = "\(t.title) \(t.url?.absoluteString ?? "")"
-                if FuzzyMatch.score(query: query, target: target) != nil, out.count < 4 {
-                    out.append(OmniboxSuggestion(kind: .openTab(t.id), title: t.title, detail: "Switch to tab", url: t.url))
+        case .navigate:
+            if let action = OmniboxClassifier.classify(query, search: config.search) {
+                switch action {
+                case .navigate(let url):
+                    out.append(.suggestion(OmniboxSuggestion(kind: .action, title: url.absoluteString, detail: "Open", url: url)))
+                case .search(let engine, let q):
+                    out.append(.suggestion(OmniboxSuggestion(kind: .action, title: q, detail: "Search \(engine.name)", url: engine.searchURL(for: q))))
                 }
             }
-            if let store {
-                for entry in store.suggest(query, limit: 8) {
-                    guard let url = URL(string: entry.url) else { continue }
-                    out.append(OmniboxSuggestion(kind: .history, title: entry.title.isEmpty ? entry.url : entry.title, detail: entry.url, url: url))
+            if !query.isEmpty {
+                let ws = activeWorkspace
+                for t in ws.tabs where t.id != ws.activeTabID {
+                    let target = "\(t.title) \(t.url?.absoluteString ?? "")"
+                    if FuzzyMatch.score(query: query, target: target) != nil, out.count < 4 {
+                        out.append(.suggestion(OmniboxSuggestion(kind: .openTab(t.id), title: t.title, detail: "Switch to tab", url: t.url)))
+                    }
+                }
+                if let store {
+                    for entry in store.suggest(query, limit: 8) {
+                        guard let url = URL(string: entry.url) else { continue }
+                        out.append(.suggestion(OmniboxSuggestion(kind: .history, title: entry.title.isEmpty ? entry.url : entry.title, detail: entry.url, url: url)))
+                    }
                 }
             }
         }
-        omniboxSuggestions = out
-        omniboxSelection = min(omniboxSelection, max(0, out.count - 1))
+        paletteRows = out
+        paletteSelection = min(paletteSelection, max(0, out.count - 1))
     }
 
-    func commitOmnibox(newTab openInNewTab: Bool = false) {
+    func commitPalette(newTab openInNewTab: Bool = false) {
         defer { closeOverlays() }
-        guard !omniboxSuggestions.isEmpty else { return }
-        let choice = omniboxSuggestions[min(omniboxSelection, omniboxSuggestions.count - 1)]
-        if case .openTab(let tabID) = choice.kind {
+        guard !paletteRows.isEmpty else { return }
+        let row = paletteRows[min(paletteSelection, paletteRows.count - 1)]
+        switch row {
+        case .command(let command):
+            command.action()
+        case .tab(let tabID, let workspaceIndex, _, _):
+            switchWorkspace(workspaceIndex)
             selectTab(tabID)
-            return
+        case .suggestion(let choice):
+            if case .openTab(let tabID) = choice.kind {
+                selectTab(tabID)
+                return
+            }
+            guard let url = choice.url else { return }
+            if openInNewTab || activeWorkspace.activeTabID == nil {
+                let id = newTab(url: url)
+                navigate(tabID: id, to: url)
+            } else if let active = activeWorkspace.activeTabID {
+                navigate(tabID: active, to: url)
+            }
         }
-        guard let url = choice.url else { return }
-        if openInNewTab || activeWorkspace.activeTabID == nil {
-            let id = newTab(url: url)
-            navigate(tabID: id, to: url)
-        } else if let active = activeWorkspace.activeTabID {
-            navigate(tabID: active, to: url)
-        }
-    }
-
-    func commitPalette() {
-        let matches = commands.paletteCommands(query: paletteText)
-        defer { closeOverlays() }
-        guard !matches.isEmpty else { return }
-        let index = min(paletteSelection, matches.count - 1)
-        matches[index].action()
     }
 
     // MARK: Key handling
@@ -490,38 +536,64 @@ final class AppModel: ObservableObject {
 
     func handleKey(_ event: NSEvent) -> Bool {
         guard let chord = KeyChord.from(event: event) else { return false }
-        if showFind, !showOmnibox, !showPalette, chord.key == "escape" {
+        if showFind, !showPalette, chord.key == "escape" {
             closeFind()
             return true
         }
-        if showOmnibox || showPalette {
+        if showPalette {
             switch chord.key {
             case "escape":
                 closeOverlays()
                 return true
             case "down" where !chord.cmd, "up" where !chord.cmd:
                 let delta = chord.key == "down" ? 1 : -1
-                if showOmnibox {
-                    let count = max(omniboxSuggestions.count, 1)
-                    omniboxSelection = (omniboxSelection + delta + count) % count
-                } else {
-                    let count = max(commands.paletteCommands(query: paletteText).count, 1)
-                    paletteSelection = (paletteSelection + delta + count) % count
-                }
+                let count = max(paletteRows.count, 1)
+                paletteSelection = (paletteSelection + delta + count) % count
                 return true
             case "enter":
-                if showOmnibox {
-                    commitOmnibox(newTab: chord.cmd)
-                } else {
-                    commitPalette()
-                }
+                commitPalette(newTab: chord.cmd)
                 return true
             default:
                 return false
             }
         }
-        guard let commandID = keymap.command(for: chord) else { return false }
-        return commands.execute(commandID)
+        let candidate = pendingChords + [chord]
+        switch keymap.match(candidate) {
+        case .command(let commandID):
+            resetSequence()
+            return commands.execute(commandID)
+        case .prefix:
+            // A bare key that starts a sequence must not swallow typing
+            // into a page or a text field.
+            if pendingChords.isEmpty, !chord.cmd, !chord.ctrl, !chord.alt, isTypingContext {
+                return false
+            }
+            pendingChords = candidate
+            pendingKeys = candidate.map(\.description).joined(separator: " ")
+            sequenceTimer?.invalidate()
+            sequenceTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self] _ in
+                DispatchQueue.main.async { self?.resetSequence() }
+            }
+            return true
+        case .none:
+            if !pendingChords.isEmpty {
+                resetSequence()
+                return true
+            }
+            return false
+        }
+    }
+
+    private func resetSequence() {
+        pendingChords = []
+        pendingKeys = nil
+        sequenceTimer?.invalidate()
+        sequenceTimer = nil
+    }
+
+    private var isTypingContext: Bool {
+        guard let responder = NSApp.keyWindow?.firstResponder else { return false }
+        return responder is NSText || responder is WKWebView
     }
 
     // MARK: Core commands
@@ -542,7 +614,8 @@ final class AppModel: ObservableObject {
             ("pane.focus-next", "Focus Next Pane", "Pane", { [weak self] in self?.focusNextPane() }),
             ("sidebar.toggle", "Toggle Sidebar", "Layout", { [weak self] in self?.sidebarVisible.toggle() }),
             ("omnibox.open", "Open Location", "Navigate", { [weak self] in self?.openOmnibox() }),
-            ("palette.open", "Command Palette", "App", { [weak self] in self?.openPalette() }),
+            ("palette.open", "Command Palette", "App", { [weak self] in self?.openCommandPalette() }),
+            ("tab.search", "Search Tabs Everywhere", "Tab", { [weak self] in self?.openTabSearch() }),
             ("nav.back", "Back", "Navigate", { [weak self] in self?.webViews.goBack() }),
             ("nav.forward", "Forward", "Navigate", { [weak self] in self?.webViews.goForward() }),
             ("nav.reload", "Reload Page", "Navigate", { [weak self] in self?.webViews.reload() }),

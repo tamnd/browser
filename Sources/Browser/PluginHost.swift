@@ -5,15 +5,50 @@ struct PluginManifest: Codable, Equatable {
     var id: String
     var name: String
     var version: String
+    var minAppVersion: String?
+    var permissions: [String]?
+    var suggestedKeymap: [String: String]?
+
+    // No permissions exist yet; the first one ships with browser.fetch.
+    // Rejecting unknown names now means old app versions fail loudly
+    // instead of running a plugin without the guarantee it asked for.
+    static let knownPermissions: Set<String> = []
+
+    func validate(appVersion: String) -> String? {
+        for permission in permissions ?? [] where !PluginManifest.knownPermissions.contains(permission) {
+            return "unknown permission \"\(permission)\""
+        }
+        if let minAppVersion, Semver.compare(appVersion, minAppVersion) < 0 {
+            return "needs app \(minAppVersion) or newer, this is \(appVersion)"
+        }
+        return nil
+    }
 }
 
-// v0.1 plugin host: one JSContext per plugin, everything on the main thread.
-// API surface: browser.commands.register, browser.ui.notify,
-// browser.tabs.open/list/active, browser.storage.get/set.
+enum Semver {
+    // Plain numeric dotted compare, missing parts count as zero.
+    static func compare(_ a: String, _ b: String) -> Int {
+        let pa = a.split(separator: ".").map { Int($0) ?? 0 }
+        let pb = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(pa.count, pb.count) {
+            let x = i < pa.count ? pa[i] : 0
+            let y = i < pb.count ? pb[i] : 0
+            if x != y { return x < y ? -1 : 1 }
+        }
+        return 0
+    }
+}
+
+// One JSContext per plugin, everything on the main thread.
+// API surface: browser.commands, browser.tabs, browser.ui, browser.storage,
+// browser.events, browser.styles.
 @MainActor
 final class PluginHost {
+    static let appVersion = "0.1.2"
+
     private weak var model: AppModel?
     private var contexts: [String: JSContext] = [:]
+    private var listeners: [String: [(pluginID: String, fn: JSValue)]] = [:]
     private(set) var loaded: [PluginManifest] = []
     private(set) var errors: [String] = []
 
@@ -21,11 +56,39 @@ final class PluginHost {
         self.model = model
     }
 
+    // Plugin manifest suggestions, layered under the user keymap.
+    var suggestedKeys: [String: String] {
+        var out: [String: String] = [:]
+        for manifest in loaded {
+            for (chord, command) in manifest.suggestedKeymap ?? [:] {
+                out[chord] = command
+            }
+        }
+        return out
+    }
+
     func loadEnabled() {
         guard let model else { return }
         for id in model.config.plugins.enabled {
             load(id: id)
         }
+    }
+
+    func reloadEnabled() {
+        guard let model else { return }
+        for id in model.config.plugins.enabled {
+            unload(id: id)
+            load(id: id)
+        }
+        model.rebuildKeymap()
+        model.banner = "plugins reloaded"
+    }
+
+    func reload(id: String) {
+        unload(id: id)
+        load(id: id)
+        model?.rebuildKeymap()
+        model?.banner = "plugin \(id) reloaded"
     }
 
     func load(id: String) {
@@ -37,6 +100,11 @@ final class PluginHost {
               let manifest = try? JSONDecoder().decode(PluginManifest.self, from: manifestData),
               let source = try? String(contentsOf: mainURL, encoding: .utf8) else {
             errors.append("plugin \(id): missing or invalid manifest.json/main.js")
+            return
+        }
+        if let problem = manifest.validate(appVersion: PluginHost.appVersion) {
+            errors.append("plugin \(id): \(problem)")
+            model?.banner = "plugin \(id): \(problem)"
             return
         }
         guard let context = JSContext() else { return }
@@ -52,20 +120,37 @@ final class PluginHost {
         context.evaluateScript(source)
         contexts[id] = context
         loaded.append(manifest)
+        model?.commands.register(Command(id: "plugin.reload.\(id)", title: "Reload Plugin: \(manifest.name)", category: "Plugin", source: "plugin:\(id)") { [weak self] in
+            self?.reload(id: id)
+        })
         if let onload = context.objectForKeyedSubscript("onload"), !onload.isUndefined {
             onload.call(withArguments: [])
         }
     }
 
-    func unloadAll() {
-        for (id, context) in contexts {
-            if let onunload = context.objectForKeyedSubscript("onunload"), !onunload.isUndefined {
-                onunload.call(withArguments: [])
-            }
-            model?.commands.unregister(source: "plugin:\(id)")
+    func unload(id: String) {
+        guard let context = contexts.removeValue(forKey: id) else { return }
+        if let onunload = context.objectForKeyedSubscript("onunload"), !onunload.isUndefined {
+            onunload.call(withArguments: [])
         }
-        contexts.removeAll()
-        loaded.removeAll()
+        model?.commands.unregister(source: "plugin:\(id)")
+        model?.webViews.removePluginStyles(pluginID: id)
+        for name in listeners.keys {
+            listeners[name]?.removeAll { $0.pluginID == id }
+        }
+        loaded.removeAll { $0.id == id }
+    }
+
+    func unloadAll() {
+        for id in Array(contexts.keys) {
+            unload(id: id)
+        }
+    }
+
+    func emit(_ name: String, _ payload: [String: Any] = [:]) {
+        for listener in listeners[name] ?? [] {
+            listener.fn.call(withArguments: [payload])
+        }
     }
 
     private func install(api context: JSContext, pluginID: String) {
@@ -74,6 +159,8 @@ final class PluginHost {
         let tabs = JSValue(newObjectIn: context)!
         let ui = JSValue(newObjectIn: context)!
         let storage = JSValue(newObjectIn: context)!
+        let events = JSValue(newObjectIn: context)!
+        let styles = JSValue(newObjectIn: context)!
 
         let registerCommand: @convention(block) (String, String, JSValue) -> Void = { [weak self] id, title, fn in
             guard let model = self?.model else { return }
@@ -133,11 +220,29 @@ final class PluginHost {
         }
         storage.setObject(storageSet, forKeyedSubscript: "set" as NSString)
 
+        let on: @convention(block) (String, JSValue) -> Void = { [weak self] name, fn in
+            self?.listeners[name, default: []].append((pluginID, fn))
+        }
+        events.setObject(on, forKeyedSubscript: "on" as NSString)
+
+        let styleRegister: @convention(block) (String, String, JSValue) -> Void = { [weak self] styleID, css, hosts in
+            let hostList = hosts.isUndefined || hosts.isNull ? [] : (hosts.toArray() as? [String] ?? [])
+            self?.model?.webViews.setPluginStyle(pluginID: pluginID, styleID: styleID, css: css, hosts: hostList)
+        }
+        styles.setObject(styleRegister, forKeyedSubscript: "register" as NSString)
+
+        let styleUnregister: @convention(block) (String) -> Void = { [weak self] styleID in
+            self?.model?.webViews.removePluginStyle(pluginID: pluginID, styleID: styleID)
+        }
+        styles.setObject(styleUnregister, forKeyedSubscript: "unregister" as NSString)
+
         browser.setObject(commands, forKeyedSubscript: "commands" as NSString)
         browser.setObject(tabs, forKeyedSubscript: "tabs" as NSString)
         browser.setObject(ui, forKeyedSubscript: "ui" as NSString)
         browser.setObject(storage, forKeyedSubscript: "storage" as NSString)
-        browser.setObject("0.1.0", forKeyedSubscript: "version" as NSString)
+        browser.setObject(events, forKeyedSubscript: "events" as NSString)
+        browser.setObject(styles, forKeyedSubscript: "styles" as NSString)
+        browser.setObject(PluginHost.appVersion, forKeyedSubscript: "version" as NSString)
         context.setObject(browser, forKeyedSubscript: "browser" as NSString)
     }
 }
