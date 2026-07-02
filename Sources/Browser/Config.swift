@@ -124,11 +124,13 @@ struct DownloadsSection: Codable, Equatable {
 
 struct PluginsSection: Codable, Equatable {
     var enabled: [String] = []
+    var devMode: Bool = false
 
     init() {}
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         enabled = try c.decodeIfPresent([String].self, forKey: .enabled) ?? []
+        devMode = try c.decodeIfPresent(Bool.self, forKey: .devMode) ?? false
     }
 }
 

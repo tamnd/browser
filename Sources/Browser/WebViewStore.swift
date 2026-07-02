@@ -16,6 +16,7 @@ final class WebViewStore: NSObject {
     private var ruleList: WKContentRuleList?
     private var downloadIDs: [ObjectIdentifier: UUID] = [:]
     private var downloadObservations: [UUID: NSKeyValueObservation] = [:]
+    private var pluginStyles: [String: (css: String, hosts: [String])] = [:]
     private let userContentController = WKUserContentController()
 
     init(model: AppModel) {
@@ -184,12 +185,33 @@ final class WebViewStore: NSObject {
         }
     }
 
-    // Snippets are injected through the shared user content controller,
-    // so one reload updates every webview's next navigation.
+    // Snippets and plugin styles are injected through the shared user content
+    // controller, so one reload updates every webview's next navigation.
     func reloadUserStyles() {
         userContentController.removeAllUserScripts()
         for css in UserStyles.loadSnippets(from: Profile.snippetsURL) {
             userContentController.addUserScript(UserStyles.script(for: css))
+        }
+        for style in pluginStyles.values {
+            userContentController.addUserScript(UserStyles.script(for: style.css, hosts: style.hosts))
+        }
+    }
+
+    func setPluginStyle(pluginID: String, styleID: String, css: String, hosts: [String]) {
+        pluginStyles["\(pluginID)/\(styleID)"] = (css, hosts)
+        reloadUserStyles()
+    }
+
+    func removePluginStyle(pluginID: String, styleID: String) {
+        guard pluginStyles.removeValue(forKey: "\(pluginID)/\(styleID)") != nil else { return }
+        reloadUserStyles()
+    }
+
+    func removePluginStyles(pluginID: String) {
+        let before = pluginStyles.count
+        pluginStyles = pluginStyles.filter { !$0.key.hasPrefix("\(pluginID)/") }
+        if pluginStyles.count != before {
+            reloadUserStyles()
         }
     }
 }
@@ -220,6 +242,7 @@ extension WebViewStore: WKNavigationDelegate {
         guard let url = webView.url, url.scheme == "http" || url.scheme == "https" else { return }
         model?.store?.recordVisit(url: url.absoluteString, title: webView.title ?? "")
         model?.favicons.fetchIfNeeded(for: url)
+        model?.pluginHost?.emit("navigation.committed", ["tabId": tabID.uuidString, "url": url.absoluteString, "title": webView.title ?? ""])
         if let host = url.host {
             let saved = model?.store?.zoom(forHost: host) ?? 1.0
             if abs(webView.pageZoom - saved) > 0.001 {

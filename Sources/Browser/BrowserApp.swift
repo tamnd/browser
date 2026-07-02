@@ -30,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         MainActor.assumeIsolated {
+            AppModel.shared.pluginHost?.unloadAll()
             AppModel.shared.saveSessionNow()
         }
     }

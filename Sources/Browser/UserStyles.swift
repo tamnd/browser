@@ -11,19 +11,30 @@ enum UserStyles {
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
 
-    static func script(for css: String) -> WKUserScript {
-        WKUserScript(source: injectionJS(css: css), injectionTime: .atDocumentEnd, forMainFrameOnly: false)
+    static func script(for css: String, hosts: [String] = []) -> WKUserScript {
+        WKUserScript(source: injectionJS(css: css, hosts: hosts), injectionTime: .atDocumentEnd, forMainFrameOnly: false)
     }
 
-    static func injectionJS(css: String) -> String {
-        let encoded = (try? JSONEncoder().encode(css)).flatMap { String(data: $0, encoding: .utf8) } ?? "\"\""
+    // An empty host list applies everywhere; otherwise the page host must
+    // equal an entry or be a subdomain of one.
+    static func injectionJS(css: String, hosts: [String] = []) -> String {
+        let encodedCSS = encode(css) ?? "\"\""
+        let encodedHosts = encode(hosts) ?? "[]"
         return """
         (function() {
+            var hosts = \(encodedHosts);
+            if (hosts.length && !hosts.some(function(h) {
+                return location.host === h || location.host.slice(-h.length - 1) === '.' + h;
+            })) { return; }
             var style = document.createElement('style');
             style.setAttribute('data-browser-snippet', '');
-            style.textContent = \(encoded);
+            style.textContent = \(encodedCSS);
             (document.head || document.documentElement).appendChild(style);
         })();
         """
+    }
+
+    private static func encode<T: Encodable>(_ value: T) -> String? {
+        (try? JSONEncoder().encode(value)).flatMap { String(data: $0, encoding: .utf8) }
     }
 }
