@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import SwiftUI
+import WebKit
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -22,11 +23,21 @@ final class AppModel: ObservableObject {
     @Published var paletteText = ""
     @Published var paletteSelection = 0
 
+    @Published var showFind = false
+    @Published var findText = ""
+    @Published var findMatched: Bool?
+
+    @Published var downloads: [DownloadItem] = []
+
     let commands = CommandRegistry()
+    let favicons = FaviconStore()
     private(set) var keymap = Keymap()
     private(set) var store: DataStore?
     lazy var webViews = WebViewStore(model: self)
     private(set) var pluginHost: PluginHost?
+    private(set) var closedTabs = ClosedTabStack()
+    private var blockingEnabled = true
+    private var runtimeAllowlist: Set<String> = []
     private var watcher: DirectoryWatcher?
     private var keyMonitor: Any?
     private var sessionSaveTimer: Timer?
@@ -56,6 +67,7 @@ final class AppModel: ObservableObject {
             banner = "profile: \(error.localizedDescription)"
         }
         store = try? DataStore(path: Profile.databasePath)
+        favicons.onUpdate = { [weak self] in self?.objectWillChange.send() }
         reloadConfig()
         registerCoreCommands()
         restoreOrSeedSession()
@@ -79,11 +91,80 @@ final class AppModel: ObservableObject {
         if firstLoad {
             sidebarVisible = loaded.layout.sidebarVisible
         }
+        blockingEnabled = loaded.privacy.blockTrackers
         webViews.reloadUserStyles()
+        reloadContentRules()
         if let warning = warnings.first ?? keymap.warnings.first {
             banner = warning
         } else if !firstLoad {
             banner = nil
+        }
+    }
+
+    // MARK: Content blocking
+
+    func reloadContentRules() {
+        guard blockingEnabled else {
+            webViews.apply(ruleList: nil)
+            return
+        }
+        let blocklist = ContentBlocker.loadBlocklist(from: Profile.blocklistURL)
+        let allow = blocklist.allowlist + config.privacy.allowlist + Array(runtimeAllowlist)
+        guard let json = ContentBlocker.rulesJSON(domains: blocklist.domains, allowlist: allow, rawRules: blocklist.rawRules) else { return }
+        WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "browser-blocklist", encodedContentRuleList: json) { [weak self] list, error in
+            DispatchQueue.main.async {
+                if let error {
+                    self?.banner = "blocklist: \(error.localizedDescription)"
+                    return
+                }
+                self?.webViews.apply(ruleList: list)
+            }
+        }
+    }
+
+    func toggleShields() {
+        blockingEnabled.toggle()
+        reloadContentRules()
+        banner = blockingEnabled ? "content blocking on" : "content blocking off until the next config reload"
+    }
+
+    func toggleSiteShields() {
+        guard let host = activeWorkspace.activeTabID.flatMap({ tab($0)?.url?.host }) else { return }
+        if runtimeAllowlist.contains(host) {
+            runtimeAllowlist.remove(host)
+            banner = "blocking restored on \(host)"
+        } else {
+            runtimeAllowlist.insert(host)
+            banner = "trackers allowed on \(host) until quit"
+        }
+        reloadContentRules()
+        webViews.reload()
+    }
+
+    // MARK: Downloads
+
+    func downloadStarted(id: UUID) {
+        downloads.append(DownloadItem(id: id))
+    }
+
+    func downloadNamed(id: UUID, filename: String) {
+        guard let i = downloads.firstIndex(where: { $0.id == id }) else { return }
+        downloads[i].filename = filename
+    }
+
+    func downloadProgress(id: UUID, fraction: Double) {
+        guard let i = downloads.firstIndex(where: { $0.id == id }) else { return }
+        downloads[i].fraction = fraction
+    }
+
+    func downloadFinished(id: UUID, error: String?) {
+        guard let i = downloads.firstIndex(where: { $0.id == id }) else { return }
+        downloads[i].fraction = 1
+        if let error {
+            downloads[i].state = .failed(error)
+            banner = "download failed: \(error)"
+        } else {
+            downloads[i].state = .done
         }
     }
 
@@ -144,6 +225,9 @@ final class AppModel: ObservableObject {
         guard let target = id ?? ws.activeTabID,
               let index = ws.tabs.firstIndex(where: { $0.id == target }) else { return }
         let closed = ws.tabs.remove(at: index)
+        if closed.url != nil {
+            closedTabs.push(ClosedTab(url: closed.url, title: closed.title, pinned: closed.pinned, workspaceID: ws.id))
+        }
         for i in ws.tabs.indices where ws.tabs[i].parentID == closed.id {
             ws.tabs[i].parentID = closed.parentID
         }
@@ -167,6 +251,20 @@ final class AppModel: ObservableObject {
         activeWorkspace = ws
         webViews.discard(tabID: target)
         scheduleSessionSave()
+    }
+
+    func reopenTab() {
+        guard let record = closedTabs.pop() else { return }
+        if workspaces.contains(where: { $0.id == record.workspaceID }) {
+            activeWorkspaceID = record.workspaceID
+        }
+        let id = newTab(url: record.url)
+        if record.pinned {
+            updateTab(id) { $0.pinned = true }
+        }
+        if let url = record.url {
+            navigate(tabID: id, to: url)
+        }
     }
 
     func selectTab(_ id: UUID) {
@@ -279,6 +377,31 @@ final class AppModel: ObservableObject {
         activeWorkspace = ws
     }
 
+    // MARK: Find in page
+
+    func openFind() {
+        guard activeWorkspace.activeTabID != nil else { return }
+        closeOverlays()
+        findMatched = nil
+        showFind = true
+    }
+
+    func closeFind() {
+        showFind = false
+        findMatched = nil
+        webViews.clearSelection()
+    }
+
+    func findNext(forward: Bool = true) {
+        guard !findText.isEmpty else { return }
+        if !showFind {
+            showFind = true
+        }
+        webViews.find(findText, forward: forward) { [weak self] matched in
+            self?.findMatched = matched
+        }
+    }
+
     // MARK: Omnibox and palette
 
     func openOmnibox() {
@@ -367,6 +490,10 @@ final class AppModel: ObservableObject {
 
     func handleKey(_ event: NSEvent) -> Bool {
         guard let chord = KeyChord.from(event: event) else { return false }
+        if showFind, !showOmnibox, !showPalette, chord.key == "escape" {
+            closeFind()
+            return true
+        }
         if showOmnibox || showPalette {
             switch chord.key {
             case "escape":
@@ -406,6 +533,7 @@ final class AppModel: ObservableObject {
             ("tab.next", "Next Tab", "Tab", { [weak self] in self?.cycleTab(1) }),
             ("tab.prev", "Previous Tab", "Tab", { [weak self] in self?.cycleTab(-1) }),
             ("tab.pin-toggle", "Pin or Unpin Tab", "Tab", { [weak self] in self?.togglePin() }),
+            ("tab.reopen", "Reopen Closed Tab", "Tab", { [weak self] in self?.reopenTab() }),
             ("workspace.new", "New Workspace", "Workspace", { [weak self] in self?.newWorkspace() }),
             ("workspace.next", "Next Workspace", "Workspace", { [weak self] in self?.cycleWorkspace(1) }),
             ("workspace.prev", "Previous Workspace", "Workspace", { [weak self] in self?.cycleWorkspace(-1) }),
@@ -421,6 +549,18 @@ final class AppModel: ObservableObject {
             ("zoom.in", "Zoom In", "Page", { [weak self] in self?.webViews.zoom(by: 0.1) }),
             ("zoom.out", "Zoom Out", "Page", { [weak self] in self?.webViews.zoom(by: -0.1) }),
             ("zoom.reset", "Reset Zoom", "Page", { [weak self] in self?.webViews.zoomReset() }),
+            ("find.open", "Find in Page", "Page", { [weak self] in self?.openFind() }),
+            ("find.next", "Find Next", "Page", { [weak self] in self?.findNext() }),
+            ("find.prev", "Find Previous", "Page", { [weak self] in self?.findNext(forward: false) }),
+            ("shields.toggle", "Toggle Content Blocking", "Privacy", { [weak self] in self?.toggleShields() }),
+            ("shields.site", "Allow or Block Trackers on This Site", "Privacy", { [weak self] in self?.toggleSiteShields() }),
+            ("downloads.reveal", "Show Downloads Folder", "App", { [weak self] in
+                guard let self else { return }
+                NSWorkspace.shared.open(self.config.downloads.resolvedURL)
+            }),
+            ("downloads.clear", "Clear Finished Downloads", "App", { [weak self] in
+                self?.downloads.removeAll { $0.state != .running }
+            }),
             ("config.reload", "Reload Config and Theme", "App", { [weak self] in self?.reloadConfig() }),
             ("session.save", "Save Session Now", "App", { [weak self] in self?.saveSessionNow() }),
         ]

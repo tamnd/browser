@@ -26,6 +26,9 @@ struct RootView: View {
                 }
                 PaneAreaView()
             }
+            if model.showFind {
+                FindBarView()
+            }
             if let banner = model.banner {
                 BannerView(text: banner)
             }
@@ -92,6 +95,9 @@ struct SidebarView: View {
                 .padding(.horizontal, 6)
             }
             Spacer(minLength: 0)
+            if !model.downloads.isEmpty {
+                DownloadsSectionView()
+            }
             Button {
                 model.commands.execute("tab.new")
             } label: {
@@ -160,8 +166,19 @@ struct TabRowView: View {
                 ProgressView()
                     .controlSize(.mini)
                     .frame(width: 12, height: 12)
+            } else if tab.pinned {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 9))
+                    .foregroundStyle(model.theme.color("fg.faint", scheme))
+                    .frame(width: 12)
+            } else if let icon = model.favicons.image(for: tab.url?.host) {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.medium)
+                    .frame(width: 12, height: 12)
+                    .clipShape(RoundedRectangle(cornerRadius: 2))
             } else {
-                Image(systemName: tab.pinned ? "pin.fill" : "globe")
+                Image(systemName: "globe")
                     .font(.system(size: 9))
                     .foregroundStyle(model.theme.color("fg.faint", scheme))
                     .frame(width: 12)
@@ -195,6 +212,109 @@ struct TabRowView: View {
         .contentShape(Rectangle())
         .onTapGesture { model.selectTab(tab.id) }
         .onHover { hovering = $0 }
+    }
+}
+
+struct DownloadsSectionView: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.colorScheme) var scheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Downloads")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(model.theme.color("fg.muted", scheme))
+                Spacer()
+                Button("Clear") {
+                    model.commands.execute("downloads.clear")
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 10))
+                .foregroundStyle(model.theme.color("fg.faint", scheme))
+            }
+            ForEach(model.downloads.suffix(4)) { item in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 5) {
+                        Image(systemName: icon(for: item.state))
+                            .font(.system(size: 9))
+                            .foregroundStyle(model.theme.color("fg.faint", scheme))
+                        Text(item.filename)
+                            .font(.system(size: 11))
+                            .lineLimit(1)
+                            .foregroundStyle(model.theme.color("fg.primary", scheme))
+                    }
+                    if item.state == .running {
+                        ProgressView(value: item.fraction)
+                            .controlSize(.small)
+                    }
+                }
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(model.theme.color("bg.raised", scheme)))
+        .padding(6)
+    }
+
+    private func icon(for state: DownloadItem.State) -> String {
+        switch state {
+        case .running: return "arrow.down.circle"
+        case .done: return "checkmark.circle"
+        case .failed: return "exclamationmark.circle"
+        }
+    }
+}
+
+struct FindBarView: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.colorScheme) var scheme
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11))
+                .foregroundStyle(model.theme.color("fg.faint", scheme))
+            TextField("Find in page", text: $model.findText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+                .frame(width: 180)
+                .focused($focused)
+                .onChange(of: model.findText) {
+                    model.findNext()
+                }
+                .onSubmit {
+                    model.findNext()
+                }
+            if model.findMatched == false {
+                Text("No matches")
+                    .font(.system(size: 11))
+                    .foregroundStyle(model.theme.color("fg.faint", scheme))
+            }
+            Button { model.findNext(forward: false) } label: {
+                Image(systemName: "chevron.up").font(.system(size: 10, weight: .bold))
+            }
+            .buttonStyle(.plain)
+            Button { model.findNext() } label: {
+                Image(systemName: "chevron.down").font(.system(size: 10, weight: .bold))
+            }
+            .buttonStyle(.plain)
+            Button { model.closeFind() } label: {
+                Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
+            }
+            .buttonStyle(.plain)
+        }
+        .foregroundStyle(model.theme.color("fg.muted", scheme))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(model.theme.color("bg.raised", scheme))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(model.theme.color("border", scheme)))
+        .shadow(color: .black.opacity(0.15), radius: 12, y: 4)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+        .padding(.top, 10)
+        .padding(.trailing, 16)
+        .onAppear { focused = true }
     }
 }
 
